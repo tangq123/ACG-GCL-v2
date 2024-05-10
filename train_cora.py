@@ -271,7 +271,7 @@ if __name__ == '__main__':
 
     parser.add_argument('--name', type=str, default='cora')
     parser.add_argument('--hid_units', type=int, default=512, help='embedding dimension')
-    parser.add_argument('--n_samples', type=int, default=3000, help='number of samples')
+    parser.add_argument('--n_samples', type=int, default=5000, help='number of samples')
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--view_lr', type=float, default=1e-3, help='View Learning rate.')
     # min step
@@ -295,15 +295,8 @@ if __name__ == '__main__':
     # args.seed = random.randint(1, 10000)
     print(args.seed)
     setup_seed(args.seed)  #
-    for alpha in [0.5]:
-        args.alpha = alpha
-        for lambda_1 in [0]:
-            args.lambda_1 = lambda_1
-            args.lambda_2 = lambda_1
-            acc_mean, acc_std, cacc, nmi, ari, f1 = train(args)
-            with open('log_{}.txt'.format(args.name), 'a') as f:
-                f.write(str(args) + '\n')
-                f.write(str(acc_mean) + '\t' + str(acc_std) + '\t' + str(cacc) + '\t' + str(nmi) + '\t' + str(
-                    ari) + '\t' + str(f1) + '\n')
-        if alpha == 1:
-            break
+    acc_mean, acc_std, cacc, nmi, ari, f1 = train(args)
+    with open('log_{}.txt'.format(args.name), 'a') as f:
+        f.write(str(args) + '\n')
+        f.write(str(acc_mean) + '\t' + str(acc_std) + '\t' + str(cacc) + '\t' + str(nmi) + '\t' + str(
+            ari) + '\t' + str(f1) + '\n')
