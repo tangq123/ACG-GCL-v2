@@ -1,284 +1,302 @@
+# from load_data import *
+import math
+import random
+import warnings
+from MODEL import ViewLearner, MVGRL, LogReg
+import pandas as pd
+
+warnings.filterwarnings('ignore')
 import torch
-from torch.utils.data import Dataset,random_split
+from dataset import load, normalize_adj_torch
+from utils import setup_seed, eva, target_distribution
+from torch.optim import Adam
+import torch.nn.functional as F
+# import dgl
+from sklearn.cluster import KMeans
+import torch.nn as nn
 import numpy as np
-import scipy.sparse as sp
-import os
-import networkx as nx
-from munkres import Munkres, print_matrix
-from sklearn import metrics
-from dgl.data import CoraGraphDataset, CiteseerGraphDataset, PubmedGraphDataset, AmazonCoBuyComputerDataset,AmazonCoBuyPhotoDataset,CoauthorCSDataset,CoauthorPhysicsDataset
+
+warnings.filterwarnings('ignore')
+from sklearn.metrics.pairwise import cosine_similarity
+from scipy.linalg import fractional_matrix_power, inv
+from sklearn.manifold import TSNE
+from sklearn.metrics import silhouette_score
+# import seaborn as sns
+import matplotlib
+
+# matplotlib.use('svg')
+# plt.switch_backend('agg')
+matplotlib.use('svg')
+import matplotlib.pyplot as plt
 
 
-def download(name):
-    if name == 'Cora':
-        dataset = CoraGraphDataset()
-    elif name == 'Citeseer':
-        dataset = CiteseerGraphDataset()
-    elif name =='Pubmed':
-        dataset = PubmedGraphDataset()
-    elif name == 'AmazonComputer':
-        dataset = AmazonCoBuyComputerDataset()
-    elif name == 'AmazonPhoto':
-        dataset = AmazonCoBuyPhotoDataset()
-    elif name =='CoauthorCS':
-        dataset = CoauthorCSDataset()
-    elif name == 'CoauthorPhysics':
-        dataset = CoauthorPhysicsDataset()
-    return dataset
+def train(args):
+    ## load dataset
+    adj_matrix, feature_matrix, labels, idx_train, _, idx_test = load(args.name)
+    n_clusters = np.unique(labels).shape[0]
+    # args.K = n_clusters
+    n_nodes = feature_matrix.shape[0]
+    fea_units = feature_matrix.shape[1]
 
-def generate_split(num_samples: int, train_ratio: float, val_ratio: float):
-    train_len = int(num_samples * train_ratio)
-    val_len = int(num_samples * val_ratio)
-    test_len = num_samples - train_len - val_len
-
-    idx_train, idx_val, idx_test = random_split(torch.arange(0, num_samples), (train_len, val_len, test_len))
-
-    return idx_train, idx_val, idx_test
-
-def process_dataset(dataset,Norm=False):
-
-    datadir = os.path.join('data', dataset)
-
-    if not os.path.exists(datadir):
-        os.makedirs(datadir)
-        ds = download(dataset)
-        graph = ds[0]
-        adj = graph.adj()
-        feat = graph.ndata.pop('feat')
-        labels = graph.ndata.pop('label')
-        if dataset in ['Cora','Citeseer']:
-            train_mask = graph.ndata.pop('train_mask')
-            val_mask = graph.ndata.pop('val_mask')
-            test_mask = graph.ndata.pop('test_mask')
-            idx_train = torch.nonzero(train_mask, as_tuple=False).squeeze()
-            idx_val = torch.nonzero(val_mask, as_tuple=False).squeeze()
-            idx_test = torch.nonzero(test_mask, as_tuple=False).squeeze()
-        elif dataset in ['Pubmed','AmazonComputer', 'AmazonPhoto','CoauthorCS','CoauthorPhysics']:
-            idx_train, idx_val, idx_test = generate_split(graph.number_of_nodes(),0.1,0.1)
-            
-        torch.save(adj,f'{datadir}/adj.pt')
-        torch.save(feat,f'{datadir}/feat.pt')
-        torch.save(labels,f'{datadir}/labels.pt')
-        torch.save(idx_train,f'{datadir}/idx_train.pt')
-        torch.save(idx_val,f'{datadir}/idx_val.pt')
-        torch.save(idx_test,f'{datadir}/idx_test.pt')
+    if args.name == 'cora' or args.name == 'citeseer':  # full-graph training
+        n_samples = n_nodes
     else:
-        adj = torch.load(f'{datadir}/adj.pt')
-        feat = torch.load(f'{datadir}/feat.pt')
-        labels = torch.load(f'{datadir}/labels.pt')
-        idx_train = torch.load(f'{datadir}/idx_train.pt')
-        idx_val = torch.load(f'{datadir}/idx_val.pt')
-        idx_test = torch.load(f'{datadir}/idx_test.pt')
+        n_samples = args.n_samples  # sub-graph training
 
-    # if Norm: # The node feature in DGL is row-normalized.
-    #     print('additional processing')
-    #     feat = torch.tensor(preprocess_features(feat.numpy())).float()
+    ## create model
+    model = MVGRL(fea_units, args.hid_units, args.K, args.tau, args.gama)
+    model = model.to(args.device) # The program may stop here unless you have enough GPU memory
+    # print(model.state_dict().keys())
+    view_learner = ViewLearner(fea_units, args.hid_units).to(args.device)
+    # print(view_learner.state_dict().keys())
 
-    return adj, feat, labels, idx_train, idx_val, idx_test
+    ## setup optimizer
+    view_optimizer = Adam(view_learner.parameters(), lr=args.view_lr)  #
+    model_optimizer = Adam(model.parameters(), lr=args.lr)
 
-class clustering_metrics():
-    "from https://github.com/Ruiqi-Hu/ARGA"
-    def __init__(self, true_label, predict_label):
-        self.true_label = true_label
-        self.pred_label = predict_label
+    adj_matrix = torch.FloatTensor(adj_matrix)
+    feature_matrix = torch.FloatTensor(feature_matrix)
+
+    best_loss = 1e9
+    best_epoch = 0
+    cnt_wait = 0
+
+    acc_reuslt = []
+    acc_reuslt.append(0)
+    nmi_result = []
+    ari_result = []
+    f1_result = []
+    tag = 'pkl/' + str(args.name) + '/' + str(args.beta) + '_' + str(args.alpha) + '_' + str(args.K) + '_' + str(
+        args.lambda_1)
+    b_xent = nn.BCEWithLogitsLoss()
+    if args.name in ['pubmed']:
+        args.epoch = args.epoch*2
+    for epoch in range(args.epoch):
+        # --------------------------------------------min step under InfoMin principle with regularization terms-------------------------------------
+        model.eval()
+        model.zero_grad()
+        view_learner.train()
+        view_learner.zero_grad()
+
+        if args.name == 'cora' or args.name == 'citeseer':  # full graph
+            sub_adj_matrix = adj_matrix.to(args.device)
+            sub_edge_index = torch.nonzero(sub_adj_matrix).t()
+            sub_feature_matrix = feature_matrix.to(args.device)
+        else:  # subgraph
+            sampled_nodes = np.random.choice(n_nodes, size=n_samples, replace=False)
+            sub_adj_matrix = adj_matrix[sampled_nodes, :][:, sampled_nodes].to(args.device)
+            sub_edge_index = torch.nonzero(sub_adj_matrix).t()  # 
+            sub_feature_matrix = feature_matrix[sampled_nodes, :].to(args.device)
+
+        # -----feature masking augmenter
+        edge_logits, fea_logits = view_learner(model.encoder, sub_feature_matrix, sub_adj_matrix,
+                                               sub_edge_index)  # shape (M,1)
+        aug_data_weight = torch.sigmoid(torch.mean(fea_logits, 0))
+        aug_data_weight2 = aug_data_weight.expand_as(sub_feature_matrix).contiguous()
+        aug_data = aug_data_weight2 * sub_feature_matrix
+
+        # -----edge weight augmenter
+        batch_aug_edge_weight = torch.sigmoid(edge_logits).squeeze()  # p
+        aug_adj = torch.sparse.FloatTensor(sub_edge_index, batch_aug_edge_weight, size=sub_adj_matrix.shape)
+        aug_adj = aug_adj.to_dense()
+        aug_adj = aug_adj * sub_adj_matrix  #
+        aug_adj = normalize_adj_torch(aug_adj, self_loop=True)  # A+I and normalize
+
+        z_igae, aug_z_igae = model.embed(sub_feature_matrix, aug_data, sub_adj_matrix, aug_adj)
+
+        view_loss = -args.beta * model.calc_loss(z_igae, aug_z_igae,
+                                                 temperature=args.tau) + args.lambda_1 * batch_aug_edge_weight.mean() + args.lambda_2 * aug_data_weight.mean()
+
+        view_loss.backward()
+        # nn.utils.clip_grad_norm(view_learner.parameters(), 5, norm_type=2)
+        view_optimizer.step()
+
+        # --------------------------------------------max step under InfoMax principle with respective to node-global MI and node-cluster MI--
+        view_learner.eval()
+        view_learner.zero_grad()
+        model.train()
+        model.zero_grad()
+        # -----feature masking augmenter
+        edge_logits, fea_logits = view_learner(model.encoder, sub_feature_matrix, sub_adj_matrix, sub_edge_index)
+        aug_data_weight = torch.sigmoid(torch.mean(fea_logits, 0))
+        aug_data_weight2 = aug_data_weight.expand_as(sub_feature_matrix).contiguous()
+        aug_data = aug_data_weight2 * sub_feature_matrix
+        # -----edge weight augmenter
+        batch_aug_edge_weight = torch.sigmoid(edge_logits).squeeze()  # p
+        aug_adj = torch.sparse.FloatTensor(sub_edge_index, batch_aug_edge_weight, size=sub_adj_matrix.shape)
+        aug_adj = aug_adj.to_dense()
+        aug_adj = aug_adj * sub_adj_matrix  #
+        aug_adj = normalize_adj_torch(aug_adj, self_loop=True)
+
+        idx = np.random.permutation(n_samples)
+        shuf_data = sub_feature_matrix[idx, :].to(args.device)
+        shuf_aug_data = aug_data[idx, :].to(args.device)
+
+        logits, logits2, z_igae, aug_z_igae = model(sub_feature_matrix, aug_data, shuf_data, shuf_aug_data,
+                                                    sub_adj_matrix, aug_adj)
+        lbl_1 = torch.ones(n_samples * 2)
+        lbl_2 = torch.zeros(n_samples * 2)
+        lbl = torch.cat((lbl_1, lbl_2)).to(args.device)
+
+        model_loss = args.alpha * b_xent(logits, lbl) + (1 - args.alpha) * b_xent(logits2, lbl)
+
+        model_loss.backward()
+        # nn.utils.clip_grad_norm(model.parameters(), 5, norm_type=2)
+        model_optimizer.step()
+
+        # if epoch % 100 == 0:
+        #     print('Epoch: {0}, Loss: {1:0.4f}'.format(epoch, model_loss.item()))
+        #     z_igae, aug_z_igae= model.embed(sub_feature_matrix, aug_data, sub_adj_matrix, aug_adj)
+        #
+        #     embs = z_igae + aug_z_igae
+        #     kmean = KMeans(n_clusters=int(n_clusters), n_init=20, random_state=seed)
+        #     for z in [embs]:
+        #         kmeans = kmean.fit(z.data.cpu().numpy())
+        #         acc, nmi, ari, f1 = eva(label, kmeans.labels_, epoch)
+
+        if model_loss < best_loss:
+            best_loss = model_loss
+            best_epoch = epoch
+            cnt_wait = 0
+            model = model.eval()
+            model.zero_grad()
+
+            view_learner = view_learner.eval()
+            view_learner.zero_grad()
+            torch.save(view_learner.state_dict(), tag + '_view_learner.pkl')
+            torch.save(model.state_dict(), tag + '_model.pkl')
+
+        else:
+            cnt_wait += 1
+
+        if cnt_wait == args.patience:
+            print('Early stopping!')
+            break
+
+    # --------------------------------------------eve step-------------------------------------
+    print('loss{},Loading {}th epoch'.format(best_loss, best_epoch))
+    view_learner.load_state_dict(torch.load(tag + '_view_learner.pkl'))
+    model.load_state_dict(torch.load(tag + '_model.pkl'))
+
+    # please put input data and model at cpu if you don't have enough GPU memory during test stage
+    # print(model.device,view_learner.device)
+    # # load dataset
+    if args.name in ['pubmed','computers', 'photo','cs','physics']:
+        model = model.cpu()
+        view_learner = view_learner.cpu()
+        args.device = 'cpu'
+
+    model = model.eval()
+    view_learner = view_learner.eval()
+    # create new graph on cpu
+    feature_matrix, adj_matrix = feature_matrix.to(args.device), adj_matrix.to(args.device)
+    edge_index = torch.nonzero(adj_matrix).t()  # 找到A中非零元素的位置
+    edge_logits, fea_logits = view_learner(model.encoder, feature_matrix.to(args.device), adj_matrix.to(args.device),
+                                           edge_index)
+    aug_data_weight = torch.sigmoid(torch.mean(fea_logits, 0))
+    aug_data_weight2 = aug_data_weight.expand_as(feature_matrix).contiguous()
+    aug_data = aug_data_weight2 * feature_matrix
+
+    batch_aug_edge_weight = torch.sigmoid(edge_logits).squeeze()  # p
+    aug_adj = torch.sparse.FloatTensor(edge_index, batch_aug_edge_weight, size=adj_matrix.shape)
+    aug_adj = aug_adj.to_dense()
+    aug_adj = aug_adj * adj_matrix
+    aug_adj = normalize_adj_torch(aug_adj, self_loop=True)
+
+    z_igae, aug_z_igae = model.embed(feature_matrix, aug_data, adj_matrix, aug_adj)
+
+    embs = z_igae + aug_z_igae
+
+    # ----clustering
+    cacc, nmi, ari, f1 = 0, 0, 0, 0
+    if 1 == 1 and args.name in ['cora', 'citeseer','pubmed']:
+        kmean = KMeans(n_clusters=int(n_clusters), n_init=20, random_state=args.seed)
+        kmeans = kmean.fit(embs.data.cpu().numpy())
+        cacc, nmi, ari, f1 = eva(labels, kmeans.labels_, best_epoch)
+
+    # ------classification
+    if 1 == 1:
+        # embs = embs2.data
+        embs = embs.data
+        train_embs = embs[idx_train].to(args.device)
+        test_embs = embs[idx_test].to(args.device)
+        labels = torch.LongTensor(labels)
+        train_lbls = labels[idx_train].to(args.device)
+        test_lbls = labels[idx_test].to(args.device)
+
+        accs = []
+        wd = 0.1 if args.name == 'citeseer' else 0.0
+        xent = nn.CrossEntropyLoss()
+        for _ in range(50):
+            log = LogReg(args.hid_units, n_clusters).to(args.device)
+            opt = torch.optim.Adam(log.parameters(), lr=1e-2, weight_decay=wd)
+            for _ in range(300):
+                log.train()
+                opt.zero_grad()
+                logits = log(train_embs)
+                loss = xent(logits, train_lbls)
+                loss.backward()
+                opt.step()
+
+            log.eval()
+            logits = log(test_embs)
+            preds = torch.argmax(logits, dim=1)
+            acc = torch.sum(preds == test_lbls).float() / test_lbls.shape[0]
+            accs.append(acc * 100)
+
+        accs = torch.stack(accs)
+        print(accs.mean().item(), accs.std().item())
+
+    return accs.mean().item(), accs.std().item(), cacc, nmi, ari, f1
 
 
-    def clusteringAcc(self):
-        # best mapping between true_label and predict label
-        l1 = list(set(self.true_label))
-        numclass1 = len(l1)
-
-        l2 = list(set(self.pred_label))
-        numclass2 = len(l2)
-        if numclass1 != numclass2:
-            print('Class Not equal, Error!!!!')
-            return 0
-
-        cost = np.zeros((numclass1, numclass2), dtype=int)
-        for i, c1 in enumerate(l1):
-            mps = [i1 for i1, e1 in enumerate(self.true_label) if e1 == c1]
-            for j, c2 in enumerate(l2):
-                mps_d = [i1 for i1 in mps if self.pred_label[i1] == c2]
-
-                cost[i][j] = len(mps_d)
-
-        # match two clustering results by Munkres algorithm
-        m = Munkres()
-        cost = cost.__neg__().tolist()
-
-        indexes = m.compute(cost)
-
-        # get the match results
-        new_predict = np.zeros(len(self.pred_label))
-        for i, c in enumerate(l1):
-            # correponding label in l2:
-            c2 = l2[indexes[i][1]]
-
-            # ai is the index with label==c2 in the pred_label list
-            ai = [ind for ind, elm in enumerate(self.pred_label) if elm == c2]
-            new_predict[ai] = c
-
-        acc = metrics.accuracy_score(self.true_label, new_predict)
-        f1_macro = metrics.f1_score(self.true_label, new_predict, average='macro')
-        precision_macro = metrics.precision_score(self.true_label, new_predict, average='macro')
-        recall_macro = metrics.recall_score(self.true_label, new_predict, average='macro')
-        f1_micro = metrics.f1_score(self.true_label, new_predict, average='micro')
-        precision_micro = metrics.precision_score(self.true_label, new_predict, average='micro')
-        recall_micro = metrics.recall_score(self.true_label, new_predict, average='micro')
-        return acc, f1_macro, precision_macro, recall_macro, f1_micro, precision_micro, recall_micro
-
-    def evaluationClusterModelFromLabel(self):
-        nmi = metrics.normalized_mutual_info_score(self.true_label, self.pred_label)
-        adjscore = metrics.adjusted_rand_score(self.true_label, self.pred_label)
-        acc, f1_macro, precision_macro, recall_macro, f1_micro, precision_micro, recall_micro = self.clusteringAcc()
-
-        
-        return acc, nmi, adjscore
-def wrong_edge(num):
-    v1 = np.random.randint(100,size = num)
-    v2 = np.random.randint(100,size = num)
-    random_edge = np.zeros((2*num,2),dtype=np.int32)
-    for i in range(num):
-       e1 = v1[i]
-       e2 = v2[i]
-       random_edge[2 * i][0] = e1
-       random_edge[2 * i][1] = e2
-       random_edge[2 * i + 1][0] = e2
-       random_edge[2 * i + 1][1] = e1
-
-    #print(random_edge)
-    return random_edge
+def list2csv(my_list, file_name):
+    import csv
+    with open(file_name, mode='w', newline='') as file:
+        writer = csv.writer(file)
+        for row in my_list:
+            writer.writerow(row)
 
 
-def new_graph(edge_index,weight,n,device):
-    indices = torch.from_numpy(np.vstack((edge_index[0], edge_index[1])).astype(np.int64)).to(device) # 二维数组
-    values = weight
-    shape = torch.Size((n,n))
-    return torch.sparse.FloatTensor(indices, values, shape)
+if __name__ == '__main__':
+    # path = '/home/guest3/workspace/tangqian/ACG-GCL_github/sensitivity/'
+    import warnings
+    print(torch.__version__)
+    print(torch.cuda.is_available())
+    warnings.filterwarnings("ignore")
+    import argparse
 
-def load_graph(k, graph_k_save_path, graph_save_path, data_path,walk_length,num_walk):
-    if k:
-        path = graph_k_save_path
-    else:
-        path = graph_save_path
+    parser = argparse.ArgumentParser()
+    # 'cora', 'citeseer', 'pubmed','computers', 'photo','cs','physics'
 
-    print("Loading path:", path)
+    parser.add_argument('--name', type=str, default='cora')
+    parser.add_argument('--hid_units', type=int, default=512, help='embedding dimension')
+    parser.add_argument('--n_samples', type=int, default=5000, help='number of samples')
+    parser.add_argument('--lr', type=float, default=1e-3)
+    parser.add_argument('--view_lr', type=float, default=1e-3, help='View Learning rate.')
+    # min step
+    parser.add_argument('--beta', type=int, default=1)
+    parser.add_argument('--lambda_1', type=float, default=1)
+    parser.add_argument('--lambda_2', type=float, default=1)
+    # max step
+    parser.add_argument('--alpha', type=int, default=0.5)
+    parser.add_argument('--K', type=int, default=16)
+    parser.add_argument('--gama', type=int, default=0.02)
+    parser.add_argument('--tau', type=int, default=0.2)
+    parser.add_argument('--epoch', type=int, default=3000)
+    parser.add_argument('--patience', type=int, default=75)
+    parser.add_argument('--cuda', type=int, default=0)
+    parser.add_argument('--seed', type=int,default=20230408)
+    args = parser.parse_args()
 
-    data = np.loadtxt(data_path, dtype=float)
-
-    n, _ = data.shape
-
-    idx = np.array([i for i in range(n)], dtype=np.int32)
-    idx_map = {j: i for i, j in enumerate(idx)}
-    edges_unordered = np.genfromtxt(path, dtype=np.int32)
-    edges = np.array(list(map(idx_map.get, edges_unordered.flatten())),
-                     dtype=np.int32).reshape(edges_unordered.shape)
-
-  #  random_edge = wrong_edge(100)
-  #  edges = np.vstack((edges,random_edge))
-    adj = sp.coo_matrix((np.ones(edges.shape[0]), (edges[:, 0], edges[:, 1])), shape=(n, n), dtype=np.float32)
-    adj = adj + adj.T.multiply(adj.T > adj) - adj.multiply(adj.T > adj)
-    adj = adj + sp.eye(adj.shape[0])
-    adj = normalize(adj)
-    adj = sparse_mx_to_torch_sparse_tensor(adj)
-
-    G = nx.DiGraph()
-
-    # add edges
-    for i in range(len(edges)):
-        src = str(edges[i][0])
-        dst = str(edges[i][1])
-        G.add_edge(src, dst)
-        G[src][dst]['weight'] = 1.0
-        #  print("88888888888888",G.edges)
-    # g = Graph(G)
-
-    model = Node2vec_onlywalk(num = n,graph=G, path_length=walk_length, num_paths=num_walk, dim=4, workers=8,
-                              window=5, p=2, q=0.5, dw=False)
-
-    return adj,model.walker#,random_edge
-
-
-def normalize(mx):
-    adj = sp.coo_matrix(adj)
-    
-    rowsum = np.array(mx.sum(1))
-    r_inv = np.power(rowsum, -1).flatten()
-    r_inv[np.isinf(r_inv)] = 0.
-    r_mat_inv = sp.diags(r_inv)
-    mx = r_mat_inv.dot(mx).tocoo().todense()
-    return mx
-
-def preprocess_features(features):
-    """Row-normalize feature matrix and convert to tuple representation"""
-    rowsum = np.array(features.sum(1)) # 按行求和
-    r_inv = np.power(rowsum, -1).flatten()
-    r_inv[np.isinf(r_inv)] = 0.
-    r_mat_inv = sp.diags(r_inv)
-    features = r_mat_inv.dot(features)
-    return features
-
-def norm_X(X):
-    X_abs = X.norm(dim=1).unsqueeze(1)
-    X_norm = X / torch.max(X_abs, 1e-8 * torch.ones_like(X_abs))
-    return X_norm
-
-def normalize_adj(adj, self_loop=False):
-    """Symmetrically normalize adjacency matrix."""
-    if self_loop:
-        adj = adj + sp.eye(adj.shape[0])
-    adj = sp.coo_matrix(adj)
-    rowsum = np.array(adj.sum(1))
-    d_inv_sqrt = np.power(rowsum, -0.5).flatten()
-    d_inv_sqrt[np.isinf(d_inv_sqrt)] = 0.
-    d_mat_inv_sqrt = sp.diags(d_inv_sqrt)
-    return adj.dot(d_mat_inv_sqrt).transpose().dot(d_mat_inv_sqrt).tocoo().todense()
-
-def normalize_adj_torch(adj,self_loop=False):
-    """Symmetrically normalize adjacency matrix."""
-    if self_loop:
-        adj = torch.eye(adj.shape[0]).to(adj.device) + adj
-    rowsum = adj.sum(1)
-    d_inv_sqrt = torch.pow(rowsum, -0.5)
-    d_inv_sqrt[torch.isinf(d_inv_sqrt)] = 0.
-    d_mat_inv_sqrt = torch.diag(d_inv_sqrt).to(adj.device)
-    return torch.mm(d_mat_inv_sqrt,torch.mm(adj,d_mat_inv_sqrt))
-    # return adj.dot(d_mat_inv_sqrt).transpose().dot(d_mat_inv_sqrt)
-def normalize_adj(adj, self_loop=True):
-    """Symmetrically normalize adjacency matrix."""
-    if self_loop:
-        adj = adj + sp.eye(adj.shape[0])
-    adj = sp.coo_matrix(adj)
-    rowsum = np.array(adj.sum(1))
-    d_inv_sqrt = np.power(rowsum, -0.5).flatten()
-    d_inv_sqrt[np.isinf(d_inv_sqrt)] = 0.
-    d_mat_inv_sqrt = sp.diags(d_inv_sqrt)
-    return adj.dot(d_mat_inv_sqrt).transpose().dot(d_mat_inv_sqrt).tocoo()
-def normal(x):
-    rowmu = (np.mean(x,axis=1)).reshape((x.shape[0],1)).repeat(x.shape[1],1)
-    rowstd = (np.std(x,axis=1)).reshape((x.shape[0],1)).repeat(x.shape[1],1)
-
-    return (x-rowmu)/rowstd
-
-
-
-def sparse_mx_to_torch_sparse_tensor(sparse_mx):
-    sparse_mx = sparse_mx.tocoo().astype(np.float32)
-    indices = torch.from_numpy(
-        np.vstack((sparse_mx.row, sparse_mx.col)).astype(np.int64))
-    values = torch.from_numpy(sparse_mx.data)
-    shape = torch.Size(sparse_mx.shape)
-    return torch.sparse.FloatTensor(indices, values, shape)
-
-
-class LoadDataset(Dataset):
-
-    def __init__(self, data):
-        self.x = data
-
-    def __len__(self):
-        return self.x.shape[0]
-
-    def __getitem__(self, idx):
-        return torch.from_numpy(np.array(self.x[idx])).float(), torch.from_numpy(np.array(idx))
-    
+    print(f"using cuda: {args.cuda}")
+    device = torch.device(f"cuda:{args.cuda}" if args.cuda > -1 else "cpu")
+    args.device = device
+    # args.seed = random.randint(1, 10000)
+    print(args.seed)
+    setup_seed(args.seed)  #
+    acc_mean, acc_std, cacc, nmi, ari, f1 = train(args)
+    with open('log_{}.txt'.format(args.name), 'a') as f:
+        f.write(str(args) + '\n')
+        f.write(str(acc_mean) + '\t' + str(acc_std) + '\t' + str(cacc) + '\t' + str(nmi) + '\t' + str(
+            ari) + '\t' + str(f1) + '\n')
